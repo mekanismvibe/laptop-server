@@ -108,7 +108,8 @@ run() {   # run <description> <command...>
 confirm() {
   [ "$ASSUME_YES" = 1 ] || [ "$DRY_RUN" = 1 ] && return 0
   local ans
-  if [ -r /dev/tty ]; then read -rp "$1 [y/N] " ans < /dev/tty; else ans=n; fi
+  if (exec < /dev/tty) 2>/dev/null; then read -rp "$1 [y/N] " ans < /dev/tty
+  else err "no terminal to confirm on; rerun with --yes"; ans=n; fi
   [[ "$ans" =~ ^[Yy] ]]
 }
 

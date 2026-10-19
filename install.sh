@@ -21,4 +21,10 @@ install -m 755 "$tmp" "$DEST"
 echo "Installed $DEST ($("$DEST" version))"
 
 # Read answers from the terminal even though this script arrived through a pipe.
-if [ -r /dev/tty ]; then exec "$DEST" setup "$@" < /dev/tty; else exec "$DEST" setup --yes "$@"; fi
+# (/dev/tty can exist but fail to open when there's no terminal, e.g. ssh without -t.)
+if (exec < /dev/tty) 2>/dev/null; then
+  exec "$DEST" setup "$@" < /dev/tty
+else
+  echo "No terminal to ask questions on; applying without confirmation."
+  exec "$DEST" setup --yes "$@"
+fi
