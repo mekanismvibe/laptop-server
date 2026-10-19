@@ -1,0 +1,668 @@
+#!/usr/bin/env bash
+# laptop-server: turn an old laptop into a well-behaved always-on server.
+#
+#   - Lid close, suspend and hibernate do nothing (sleep targets masked)
+#   - Console screen turns off after a minute
+#   - Battery charging stops at 80% and resumes below 75% (where the hardware allows)
+#   - Any wired Ethernet adapter you plug in gets the server's network config,
+#     including USB adapters that show up late, get replugged or get swapped
+#   - Wi-Fi radio switched off so the server only uses the wire
+#
+# Supports Proxmox VE (ifupdown2 bridge), Debian (ifupdown -> systemd-networkd)
+# and Ubuntu Server (netplan). Every changed file is backed up first, and
+# `laptop-server revert` undoes the last setup run.
+#
+# Usage:
+#   laptop-server setup [--dry-run] [--yes] [--charge-start N] [--charge-stop N]
+#                       [--no-network] [--no-battery] [--no-wifi-off] [--no-screen-off]
+#   laptop-server status
+#   laptop-server revert
+#   laptop-server wifi on|off
+#
+# https://github.com/mekanismvibe/laptop-server
+
+set -uo pipefail
+
+VERSION=1.0.0
+SELF=/usr/local/sbin/laptop-server
+CONF=/etc/laptop-server.conf
+BACKUP_ROOT=/var/backups/laptop-server
+BOOT_UNIT=/etc/systemd/system/laptop-server.service
+UDEV_RULE=/etc/udev/rules.d/90-laptop-server-wired.rules
+HOTPLUG_UNIT=/etc/systemd/system/laptop-server-hotplug.service
+NETWORKD_FILE=/etc/systemd/network/60-laptop-server-wired.network
+INTERFACES=${LS_INTERFACES_FILE:-/etc/network/interfaces}   # override only for testing
+NETPLAN_DIR=${LS_NETPLAN_DIR:-/etc/netplan}                   # override only for testing
+SLEEP_TARGETS="sleep.target suspend.target hibernate.target hybrid-sleep.target suspend-then-hibernate.target"
+WIRED_REGEX='^(en|eth|nic).*'
+
+DRY_RUN=0
+ASSUME_YES=0
+DO_NETWORK=1
+DO_BATTERY=1
+DO_WIFI=1
+DO_SCREEN=1
+CHARGE_START=75
+CHARGE_STOP=80
+SCREEN_MINUTES=1
+RUN_DIR=""
+
+# ---------------------------------------------------------------- output ----
+if [ -t 1 ]; then B=$'\e[1m'; G=$'\e[32m'; Y=$'\e[33m'; R=$'\e[31m'; N=$'\e[0m'; else B=; G=; Y=; R=; N=; fi
+say()  { printf '%s\n' "$*"; }
+section() { printf '\n%s==> %s%s\n' "$B" "$*" "$N"; }
+ok()   { printf '  %s✓%s %s\n' "$G" "$N" "$*"; }
+warn() { printf '  %s!%s %s\n' "$Y" "$N" "$*"; }
+err()  { printf '  %s✗%s %s\n' "$R" "$N" "$*" >&2; }
+die()  { err "$*"; exit 1; }
+plan() { printf '  %s→%s %s\n' "$Y" "$N" "$*"; }
+
+# ------------------------------------------------------------ change log ----
+# Every change goes through these helpers so --dry-run is honest and revert works.
+start_run() {
+  [ "$DRY_RUN" = 1 ] && return
+  RUN_DIR="$BACKUP_ROOT/$(date +%Y%m%d-%H%M%S)"
+  mkdir -p "$RUN_DIR"
+  : > "$RUN_DIR/backed-up"; : > "$RUN_DIR/created"; : > "$RUN_DIR/actions"
+  ln -sfn "$RUN_DIR" "$BACKUP_ROOT/latest"
+}
+
+backup() {   # backup <file>: copy once per run, before the first change
+  local f=$1
+  [ "$DRY_RUN" = 1 ] && return
+  grep -qxF "$f" "$RUN_DIR/backed-up" "$RUN_DIR/created" 2>/dev/null && return
+  if [ -e "$f" ]; then
+    mkdir -p "$RUN_DIR/files$(dirname "$f")"
+    cp -a "$f" "$RUN_DIR/files$f"
+    echo "$f" >> "$RUN_DIR/backed-up"
+  else
+    echo "$f" >> "$RUN_DIR/created"
+  fi
+}
+
+note_action() { [ "$DRY_RUN" = 1 ] || echo "$*" >> "$RUN_DIR/actions"; }
+
+write_file() {   # write_file <path> <mode> ; content on stdin
+  local f=$1 mode=$2 tmp
+  tmp=$(mktemp)
+  cat > "$tmp"
+  if [ -e "$f" ] && cmp -s "$tmp" "$f"; then rm -f "$tmp"; ok "$f already up to date"; return 0; fi
+  if [ "$DRY_RUN" = 1 ]; then
+    plan "would write $f"
+    if [ -e "$f" ]; then diff -u "$f" "$tmp" | sed 's/^/      /' | tail -n +3; else sed 's/^/      + /' "$tmp"; fi
+    rm -f "$tmp"; return 0
+  fi
+  backup "$f"
+  mkdir -p "$(dirname "$f")"
+  install -m "$mode" "$tmp" "$f"
+  rm -f "$tmp"
+  ok "wrote $f"
+}
+
+run() {   # run <description> <command...>
+  local desc=$1; shift
+  if [ "$DRY_RUN" = 1 ]; then plan "would $desc"; return 0; fi
+  if "$@" >/dev/null 2>&1; then ok "$desc"; else warn "$desc failed (non-fatal)"; return 1; fi
+}
+
+confirm() {
+  [ "$ASSUME_YES" = 1 ] || [ "$DRY_RUN" = 1 ] && return 0
+  local ans
+  if [ -r /dev/tty ]; then read -rp "$1 [y/N] " ans < /dev/tty; else ans=n; fi
+  [[ "$ans" =~ ^[Yy] ]]
+}
+
+# ------------------------------------------------------------- detection ----
+is_container() { systemd-detect-virt --container >/dev/null 2>&1; }
+is_proxmox()   { command -v pveversion >/dev/null 2>&1; }
+# shellcheck disable=SC1091
+os_name()      { ( . /etc/os-release 2>/dev/null; echo "${PRETTY_NAME:-unknown}" ); }
+
+wired_ifaces() {   # physical wired NICs present now
+  local p n
+  for p in /sys/class/net/*; do
+    n=${p##*/}
+    [[ $n =~ ^(en|eth|nic) ]] || continue
+    [ -e "$p/device" ] || continue          # skip virtual (veth, bridges, taps)
+    [ -d "$p/wireless" ] && continue
+    echo "$n"
+  done
+}
+
+default_route_dev() { ip -4 route show default 2>/dev/null | awk '{for(i=1;i<NF;i++) if($i=="dev"){print $(i+1); exit}}'; }
+default_gateway()   { ip -4 route show default 2>/dev/null | awk '{print $3; exit}'; }
+
+network_stack() {
+  if is_proxmox; then echo proxmox; return; fi
+  if compgen -G "$NETPLAN_DIR/*.yaml" >/dev/null && command -v netplan >/dev/null 2>&1; then echo netplan; return; fi
+  if systemctl is-active --quiet NetworkManager 2>/dev/null; then echo networkmanager; return; fi
+  if [ -f "$INTERFACES" ] && grep -qE "^[[:space:]]*iface[[:space:]]+(en|eth)" "$INTERFACES"; then echo ifupdown; return; fi
+  if systemctl is-enabled --quiet systemd-networkd 2>/dev/null; then echo networkd; return; fi
+  echo unknown
+}
+
+battery_dirs() {
+  local b
+  for b in /sys/class/power_supply/*; do
+    [ -e "$b/type" ] && [ "$(cat "$b/type")" = Battery ] && echo "$b"
+  done
+}
+
+# ------------------------------------------------------- lid & sleep --------
+setup_power() {
+  section "Lid, suspend and hibernate"
+  write_file /etc/systemd/logind.conf.d/50-laptop-server.conf 644 <<'EOF'
+# laptop-server: closing the lid or pressing sleep keys does nothing.
+[Login]
+HandleLidSwitch=ignore
+HandleLidSwitchExternalPower=ignore
+HandleLidSwitchDocked=ignore
+HandleSuspendKey=ignore
+HandleHibernateKey=ignore
+IdleAction=ignore
+EOF
+  write_file /etc/systemd/sleep.conf.d/50-laptop-server.conf 644 <<'EOF'
+# laptop-server: this machine is a server; never suspend or hibernate.
+[Sleep]
+AllowSuspend=no
+AllowHibernation=no
+AllowSuspendThenHibernate=no
+AllowHybridSleep=no
+EOF
+  local t masked_now=""
+  for t in $SLEEP_TARGETS; do
+    if [ "$(systemctl is-enabled "$t" 2>/dev/null)" = masked ]; then continue; fi
+    masked_now="$masked_now $t"
+  done
+  if [ -n "$masked_now" ]; then
+    # shellcheck disable=SC2086  # word-splitting the target list is intended
+    run "mask${masked_now}" systemctl mask $masked_now && note_action "masked$masked_now"
+  else
+    ok "sleep targets already masked"
+  fi
+  if [ "$DRY_RUN" = 1 ]; then plan "would reload systemd-logind"; return; fi
+  if loginctl list-sessions --no-legend 2>/dev/null | awk '{print $1}' | xargs -r -n1 loginctl show-session -p Type --value 2>/dev/null | grep -qE 'x11|wayland'; then
+    warn "a graphical session is running; lid settings apply after the next reboot"
+  else
+    run "restart systemd-logind (SSH sessions stay up)" systemctl restart systemd-logind
+  fi
+}
+
+# ------------------------------------------------------------- battery ------
+apply_battery() {   # apply_battery <start> <stop>; used by setup and at every boot
+  local start=$1 stop=$2 b any=0 got_s got_e
+  for b in $(battery_dirs); do
+    [ -w "$b/charge_control_end_threshold" ] || continue
+    any=1
+    if [ -w "$b/charge_control_start_threshold" ]; then
+      # Kernels reject start >= end, so write in an order-proof way.
+      echo "$stop"  > "$b/charge_control_end_threshold"   2>/dev/null
+      echo "$start" > "$b/charge_control_start_threshold" 2>/dev/null
+      echo "$stop"  > "$b/charge_control_end_threshold"   2>/dev/null
+    else
+      echo "$stop" > "$b/charge_control_end_threshold" 2>/dev/null
+    fi
+    # Dell (dell-laptop): thresholds only count in Custom mode.
+    if [ -w "$b/charge_types" ] && grep -qw Custom "$b/charge_types" 2>/dev/null; then
+      echo Custom > "$b/charge_types" 2>/dev/null
+    fi
+    got_e=$(cat "$b/charge_control_end_threshold" 2>/dev/null)
+    got_s=$(cat "$b/charge_control_start_threshold" 2>/dev/null || echo "-")
+    echo "${b##*/}: start=$got_s stop=$got_e"
+  done
+  [ "$any" = 1 ]
+}
+
+setup_battery() {
+  section "Battery charge limit (${CHARGE_STOP}% stop, ${CHARGE_START}% resume)"
+  local bats; bats=$(battery_dirs)
+  if [ -z "$bats" ]; then ok "no battery found, skipping"; return; fi
+  if ! grep -q . < <(for b in $bats; do [ -w "$b/charge_control_end_threshold" ] && echo y; done); then
+    warn "this laptop/kernel doesn't expose charge thresholds in /sys/class/power_supply"
+    warn "set it in the BIOS instead, for example:"
+    warn "  Dell:    Power Management > Primary Battery Charge Configuration > Custom ${CHARGE_START}-${CHARGE_STOP}"
+    warn "  Lenovo:  Vantage/BIOS 'Battery Charge Threshold'   HP: 'Adaptive Battery Optimizer'"
+    warn "  ASUS:    'Battery Health Charging' (stop only)"
+    return
+  fi
+  if [ ! -w "$(echo "$bats" | head -1)/charge_control_start_threshold" ]; then
+    warn "only a stop threshold is supported here: charging stops at ${CHARGE_STOP}%"
+  fi
+  if [ "$DRY_RUN" = 1 ]; then plan "would set thresholds now and at every boot"; return; fi
+  local out; out=$(apply_battery "$CHARGE_START" "$CHARGE_STOP")
+  ok "$out (re-applied at every boot by laptop-server.service)"
+}
+
+# ------------------------------------------------------- screen & wifi ------
+apply_screen() {   # blank the text console after N minutes
+  local m=$1
+  [ -e /dev/tty1 ] || return 0
+  TERM=linux setterm --blank "$m" --powerdown "$m" > /dev/tty1 < /dev/tty1 2>/dev/null || true
+}
+
+apply_wifi() {   # apply_wifi off|on via sysfs rfkill (works without the rfkill tool)
+  local want=$1 r
+  for r in /sys/class/rfkill/rfkill*; do
+    [ "$(cat "$r/type" 2>/dev/null)" = wlan ] || continue
+    if [ "$want" = off ]; then echo 1 > "$r/soft"; else echo 0 > "$r/soft"; fi
+  done
+}
+
+setup_screen() {
+  section "Screen off after ${SCREEN_MINUTES} min"
+  if [ "$DRY_RUN" = 1 ]; then plan "would blank the console now and at every boot"; return; fi
+  apply_screen "$SCREEN_MINUTES"; ok "console blanks after ${SCREEN_MINUTES} min (also applied at boot)"
+}
+
+setup_wifi() {
+  section "Wi-Fi off"
+  if ! ls /sys/class/rfkill/*/type >/dev/null 2>&1 || ! grep -qx wlan /sys/class/rfkill/*/type 2>/dev/null; then
+    ok "no Wi-Fi radio found, skipping"; return
+  fi
+  if [ -z "$(wired_ifaces)" ]; then
+    warn "no wired adapter is present right now; leaving Wi-Fi on so you don't lose access"
+    warn "run 'laptop-server wifi off' once the wire works"
+    return
+  fi
+  if [ "$DRY_RUN" = 1 ]; then plan "would turn the Wi-Fi radio off now and at every boot"; return; fi
+  apply_wifi off; note_action "wifi-off"
+  ok "Wi-Fi radio off (turn back on with: laptop-server wifi on)"
+}
+
+# ------------------------------------------------------------- network ------
+# Arm a timer that restores the old network config, apply the new one, and keep it
+# only if the default gateway still answers. Safe to run over SSH.
+apply_network_safely() {   # <revert-shell-cmd> <apply-function>
+  local revert=$1 apply_fn=$2 gw i
+  gw=$(default_gateway)
+  systemctl stop laptop-server-netrevert.timer >/dev/null 2>&1
+  systemd-run --quiet --unit=laptop-server-netrevert --on-active=180 /bin/sh -c "$revert" \
+    || die "could not arm the network safety timer, nothing applied"
+  say "  (safety: old network config comes back automatically in 3 min unless the new one works)"
+  "$apply_fn"
+  for i in $(seq 1 30); do
+    if [ -n "$gw" ] && ping -c1 -W1 "$gw" >/dev/null 2>&1; then
+      systemctl stop laptop-server-netrevert.timer >/dev/null 2>&1
+      ok "network works with the new config (gateway $gw answers)"
+      return 0
+    fi
+    [ -z "$gw" ] && [ -n "$(wired_ifaces)" ] && { systemctl stop laptop-server-netrevert.timer >/dev/null 2>&1; ok "applied (no default gateway to test)"; return 0; }
+    sleep 1
+  done
+  err "gateway $gw stopped answering, rolling back now"
+  systemctl stop laptop-server-netrevert.timer >/dev/null 2>&1
+  /bin/sh -c "$revert"
+  return 1
+}
+
+write_hotplug_rule() {   # ifupdown2 does not re-add a bridge port that appears later
+  # udev only *asks* systemd to start the service. Running systemd-run or ifreload directly
+  # from a udev RUN+= deadlocks at boot with ifupdown2's "udevadm settle": networking then
+  # fails and the bridge never comes up (learned the hard way on a Dell Inspiron 5481).
+  write_file "$UDEV_RULE" 644 <<'EOF'
+# laptop-server: when a wired adapter appears (late boot, replug, different adapter),
+# have systemd reload networking so the bridge's "bridge-ports regex" picks it up.
+ACTION=="add", SUBSYSTEM=="net", NAME=="en*|eth*|nic*", TAG+="systemd", ENV{SYSTEMD_WANTS}+="laptop-server-hotplug.service"
+EOF
+  write_file "$HOTPLUG_UNIT" 644 <<'EOF'
+[Unit]
+Description=laptop-server: attach a newly plugged wired adapter to the bridge
+# At boot this waits for normal network setup to finish first.
+After=networking.service
+
+[Service]
+Type=oneshot
+ExecStartPre=/bin/sleep 3
+ExecStart=/usr/sbin/ifreload -a
+EOF
+  # Earlier hand-made versions of this fix would fire a second, competing reload.
+  local old
+  for old in /etc/udev/rules.d/90-vmbr0-hotplug.rules /etc/systemd/system/wired-hotplug.service; do
+    [ -e "$old" ] || continue
+    if [ "$DRY_RUN" = 1 ]; then plan "would remove older copy $old"; else backup "$old"; rm -f "$old"; ok "removed older copy $old"; fi
+  done
+  [ "$DRY_RUN" = 1 ] && return
+  systemctl daemon-reload
+  udevadm control --reload >/dev/null 2>&1
+}
+
+# --- Proxmox: bridge-ports <one NIC>  ->  bridge-ports regex ^(en|eth).*
+proxmox_new_interfaces() {   # prints the rewritten interfaces file on stdout
+  local bridge=$1
+  awk -v br="$bridge" -v rx="$WIRED_REGEX" '
+    function present(n) { return (system("test -e /sys/class/net/" n) == 0) }
+    /^[[:space:]]*iface[[:space:]]/ { cur=$2 }
+    # comment out stale "iface <wired> inet manual" stanzas for adapters that no longer exist
+    /^[[:space:]]*(auto|allow-hotplug)[[:space:]]+(en|eth|nic)/ && !present($2) { print "#" $0 "   # laptop-server: adapter not present"; next }
+    /^[[:space:]]*iface[[:space:]]+(en|eth|nic)[^[:space:]]*[[:space:]]+inet[[:space:]]+manual/ && !present($2) {
+      print "#" $0 "   # laptop-server: adapter not present"; skip=1; next }
+    skip && /^[[:space:]]+[^[:space:]]/ { print "#" $0; next }
+    { skip=0 }
+    cur==br && /^[[:space:]]*bridge-ports[[:space:]]/ {
+      match($0, /^[[:space:]]*/); ind=substr($0, 1, RLENGTH)
+      print ind "bridge-ports regex " rx; next }
+    { print }
+  ' "$INTERFACES"
+}
+
+setup_network_proxmox() {
+  local br ports
+  br=$(default_route_dev)
+  [ -n "$br" ] || br=vmbr0
+  ports=$(awk -v br="$br" '/^[[:space:]]*iface[[:space:]]/{cur=$2} cur==br && /^[[:space:]]*bridge-ports[[:space:]]/{$1=""; print; exit}' "$INTERFACES" | xargs)
+  if [ -z "$ports" ]; then warn "no bridge-ports line for $br in $INTERFACES, skipping"; return; fi
+  if [[ $ports == regex* ]]; then ok "$br already takes any wired adapter (bridge-ports $ports)"; write_hotplug_rule; return; fi
+  if ! [[ $ports =~ ^(en|eth|nic)[^[:space:]]*$ ]]; then
+    warn "$br uses '$ports', which isn't a single wired adapter (bond, VLAN or several ports); leaving it alone"; return
+  fi
+  if ! dpkg -s ifupdown2 >/dev/null 2>&1; then warn "ifupdown2 is not installed; Proxmox needs it for this, skipping"; return; fi
+  plan "$br: bridge-ports $ports  ->  bridge-ports regex $WIRED_REGEX"
+  local new; new=$(mktemp); proxmox_new_interfaces "$br" > "$new"
+  if [ "$DRY_RUN" = 1 ]; then diff -u "$INTERFACES" "$new" | sed 's/^/      /' | tail -n +3; rm -f "$new"; write_hotplug_rule; return; fi
+  backup "$INTERFACES"
+  local saved="$RUN_DIR/files$INTERFACES"
+  _apply_proxmox() { install -m 644 "$new" "$INTERFACES"; ifreload -a >/dev/null 2>&1; }
+  apply_network_safely "cp '$saved' '$INTERFACES' && ifreload -a" _apply_proxmox && note_action "network-proxmox"
+  rm -f "$new"
+  write_hotplug_rule
+}
+
+# --- Ubuntu: netplan entry for the wired NIC  ->  match: {name: "en*"}
+netplan_rewrite() {   # <iface> <mac> <out-file>; prints the netplan file it rewrote, or ALREADY/NOTFOUND
+  python3 - "$1" "$2" "$3" "$NETPLAN_DIR" <<'PY'
+import glob, sys, yaml
+iface, mac, out, d = sys.argv[1], sys.argv[2].lower(), sys.argv[3], sys.argv[4]
+for f in sorted(glob.glob(d + "/*.yaml")):
+    doc = yaml.safe_load(open(f)) or {}
+    eth = (doc.get("network") or {}).get("ethernets") or {}
+    for key, val in eth.items():
+        val = val or {}
+        m = val.get("match") or {}
+        if m.get("name") in ("en*", "e*"):
+            print("ALREADY " + f); sys.exit(0)
+        hit = (key == iface and not m) or m.get("name") == iface or (mac and str(m.get("macaddress", "")).lower() == mac)
+        if hit:
+            val["match"] = {"name": "en*"}
+            val.pop("set-name", None)
+            eth[key] = val
+            with open(out, "w") as fh:
+                yaml.safe_dump(doc, fh, default_flow_style=False, sort_keys=False)
+            print("FILE " + f); sys.exit(0)
+print("NOTFOUND")
+PY
+}
+
+setup_network_netplan() {
+  local dev mac new res file
+  dev=$(default_route_dev)
+  [[ ${dev:-} =~ ^(en|eth) ]] || { dev=$(wired_ifaces | head -1); }
+  [ -n "$dev" ] || { warn "no wired adapter found to base the config on; plug one in and rerun"; return; }
+  mac=$(cat "/sys/class/net/$dev/address" 2>/dev/null)
+  command -v python3 >/dev/null && python3 -c 'import yaml' 2>/dev/null || { warn "python3-yaml missing, skipping netplan change"; return; }
+  new=$(mktemp)
+  res=$(netplan_rewrite "$dev" "${mac:-}" "$new")
+  case $res in
+    ALREADY*) ok "netplan already matches any wired adapter (${res#ALREADY })"; rm -f "$new"; return ;;
+    NOTFOUND) warn "no netplan ethernets entry for $dev found; leaving netplan alone"; rm -f "$new"; return ;;
+  esac
+  file=${res#FILE }
+  plan "$file: the entry for $dev now matches any wired adapter (name en*)"
+  if [ "$DRY_RUN" = 1 ]; then diff -u "$file" "$new" | sed 's/^/      /' | tail -n +3; rm -f "$new"; return; fi
+  if [ -d /etc/cloud ]; then
+    write_file /etc/cloud/cloud.cfg.d/99-laptop-server-network.cfg 644 <<'EOF'
+# laptop-server: keep cloud-init from regenerating the netplan config on boot.
+network: {config: disabled}
+EOF
+  fi
+  backup "$file"
+  local saved="$RUN_DIR/files$file"
+  _apply_netplan() { install -m 600 "$new" "$file"; netplan generate && netplan apply; }
+  apply_network_safely "cp '$saved' '$file' && netplan apply" _apply_netplan && note_action "network-netplan"
+  rm -f "$new"
+}
+
+# --- Debian: ifupdown stanza for the wired NIC  ->  systemd-networkd [Match] Name=en* eth*
+debian_stanza() {   # <iface>: prints "method|address|gateway|dns" from $INTERFACES
+  awk -v want="$1" '
+    /^[[:space:]]*iface[[:space:]]/ { cur=$2; if (cur==want && $3=="inet") method=$4; next }
+    cur==want && $1=="address"         { addr=$2 }
+    cur==want && $1=="netmask"         { mask=$2 }
+    cur==want && $1=="gateway"         { gw=$2 }
+    cur==want && $1=="dns-nameservers" { $1=""; dns=$0 }
+    END {
+      if (addr != "" && addr !~ /\// && mask != "") {
+        n=split(mask, o, "."); bits=0
+        for (i=1;i<=n;i++){ v=o[i]+0; while (v) { bits+=v%2; v=int(v/2) } }
+        addr=addr "/" bits
+      }
+      gsub(/^ +| +$/, "", dns); print method "|" addr "|" gw "|" dns
+    }' "$INTERFACES"
+}
+
+setup_network_ifupdown() {
+  local dev info method addr gw dns body
+  dev=$(default_route_dev)
+  [[ ${dev:-} =~ ^(en|eth) ]] || dev=$(awk '/^[[:space:]]*iface[[:space:]]+(en|eth)/{print $2; exit}' "$INTERFACES")
+  [ -n "$dev" ] || { warn "no wired iface stanza in $INTERFACES"; return; }
+  info=$(debian_stanza "$dev"); IFS='|' read -r method addr gw dns <<< "$info"
+  case $method in
+    dhcp)   body=$'[Network]\nDHCP=ipv4\n' ;;
+    static) [ -n "$addr" ] || { warn "static config for $dev has no address, skipping"; return; }
+            body=$'[Network]\n'"Address=$addr"$'\n'
+            [ -n "$gw" ] && body+="Gateway=$gw"$'\n'
+            for d in $dns; do body+="DNS=$d"$'\n'; done ;;
+    *)      warn "$dev uses 'inet ${method:-?}', which this script doesn't convert; leaving it alone"; return ;;
+  esac
+  plan "move $dev ($method${addr:+ $addr}) from ifupdown to systemd-networkd, matching any wired adapter"
+  local net; net=$(printf '%s\n' "# laptop-server: config for whichever wired adapter is plugged in." "[Match]" "Name=en* eth*" "" "$body")
+  local new; new=$(mktemp)
+  awk -v d="$dev" '
+    /^[[:space:]]*(auto|allow-hotplug)[[:space:]]/ { line=$0; out=$1; for (i=2;i<=NF;i++) if ($i!=d) out=out " " $i
+      if (out==$1) { print "#" line "   # laptop-server: now in systemd-networkd"; next } else { print out; next } }
+    /^[[:space:]]*iface[[:space:]]/ { inb=($2==d) }
+    inb { print "#" $0; next }
+    { print }' "$INTERFACES" > "$new"
+  if [ "$DRY_RUN" = 1 ]; then
+    plan "would write $NETWORKD_FILE:"; printf '%s\n' "$net" | sed 's/^/      + /'
+    diff -u "$INTERFACES" "$new" | sed 's/^/      /' | tail -n +3; rm -f "$new"; return
+  fi
+  backup "$INTERFACES"; backup "$NETWORKD_FILE"
+  local saved="$RUN_DIR/files$INTERFACES"
+  _apply_ifupdown() {
+    ifdown "$dev" >/dev/null 2>&1
+    install -m 644 "$new" "$INTERFACES"
+    mkdir -p "$(dirname "$NETWORKD_FILE")"; printf '%s\n' "$net" > "$NETWORKD_FILE"
+    systemctl enable systemd-networkd >/dev/null 2>&1; systemctl restart systemd-networkd
+  }
+  apply_network_safely "rm -f '$NETWORKD_FILE'; systemctl disable --now systemd-networkd; cp '$saved' '$INTERFACES'; ifup '$dev'" _apply_ifupdown \
+    && note_action "network-networkd"
+  rm -f "$new"
+}
+
+setup_network() {
+  section "Network: any wired adapter you plug in gets this server's config"
+  if is_container; then ok "running in a container; the host manages networking, skipping"; return; fi
+  local stack; stack=$(network_stack)
+  case $stack in
+    proxmox)        setup_network_proxmox ;;
+    netplan)        setup_network_netplan ;;
+    ifupdown)       setup_network_ifupdown ;;
+    networkmanager) ok "NetworkManager already brings up any wired adapter automatically, nothing to change" ;;
+    networkd)       warn "systemd-networkd without netplan: make your .network file use [Match] Name=en* eth*" ;;
+    *)              warn "couldn't tell how networking is managed here, skipping" ;;
+  esac
+  local w; w=$(wired_ifaces | xargs)
+  [ -z "$w" ] && warn "no wired adapter is visible right now. If a USB adapter vanishes after reboots, try another port, a powered hub, or BIOS: USB PowerShare off / Fastboot Thorough"
+  return 0
+}
+
+# --------------------------------------------------------- boot service -----
+write_conf_and_unit() {
+  section "Boot-time settings"
+  write_file "$CONF" 644 <<EOF
+# laptop-server settings, re-applied at every boot by laptop-server.service
+CHARGE_START=$CHARGE_START
+CHARGE_STOP=$CHARGE_STOP
+BATTERY=$DO_BATTERY
+WIFI_OFF=$DO_WIFI
+SCREEN_OFF=$DO_SCREEN
+SCREEN_MINUTES=$SCREEN_MINUTES
+EOF
+  write_file "$BOOT_UNIT" 644 <<EOF
+[Unit]
+Description=laptop-server: battery limit, Wi-Fi off, console blanking
+After=systemd-udev-settle.service sysinit.target
+
+[Service]
+Type=oneshot
+ExecStart=$SELF boot
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  if [ "$DRY_RUN" = 1 ]; then plan "would enable laptop-server.service"; return; fi
+  systemctl daemon-reload
+  run "enable laptop-server.service" systemctl enable laptop-server.service
+}
+
+cmd_boot() {   # run by laptop-server.service
+  # shellcheck disable=SC1090  # our own settings file
+  [ -r "$CONF" ] && . "$CONF"
+  [ "${BATTERY:-1}" = 1 ]    && apply_battery "${CHARGE_START:-75}" "${CHARGE_STOP:-80}"
+  [ "${WIFI_OFF:-1}" = 1 ]   && [ -n "$(wired_ifaces)" ] && apply_wifi off
+  [ "${SCREEN_OFF:-1}" = 1 ] && apply_screen "${SCREEN_MINUTES:-1}"
+  return 0
+}
+
+# --------------------------------------------------------------- setup ------
+cmd_setup() {
+  while [ $# -gt 0 ]; do
+    case $1 in
+      --dry-run)       DRY_RUN=1 ;;
+      --yes|-y)        ASSUME_YES=1 ;;
+      --charge-start)  CHARGE_START=${2:?--charge-start needs a number}; shift ;;
+      --charge-stop)   CHARGE_STOP=${2:?--charge-stop needs a number}; shift ;;
+      --no-network)    DO_NETWORK=0 ;;
+      --no-battery)    DO_BATTERY=0 ;;
+      --no-wifi-off)   DO_WIFI=0 ;;
+      --no-screen-off) DO_SCREEN=0 ;;
+      *) die "unknown option $1 (see: laptop-server help)" ;;
+    esac
+    shift
+  done
+  [[ $CHARGE_START =~ ^[0-9]+$ && $CHARGE_STOP =~ ^[0-9]+$ ]] || die "charge limits must be numbers"
+  [ "$CHARGE_START" -lt "$CHARGE_STOP" ] && [ "$CHARGE_STOP" -le 100 ] || die "need charge-start < charge-stop <= 100"
+  [ "$(id -u)" = 0 ] || die "run as root (sudo laptop-server setup)"
+  is_container && die "this is a container; run laptop-server on the laptop itself (the host)"
+
+  say "${B}laptop-server $VERSION${N} on $(os_name)$(is_proxmox && echo " (Proxmox VE)")"
+  say "Network stack: $(network_stack)   Wired adapters: $(wired_ifaces | xargs | sed 's/^$/none/')"
+  [ "$DRY_RUN" = 1 ] && say "${Y}Dry run: nothing will be changed.${N}"
+  confirm "Apply laptop server settings?" || die "cancelled, nothing changed"
+
+  # Install a copy of this script so the boot service and `status` work later.
+  if [ "$DRY_RUN" != 1 ] && [ "$(readlink -f "$0")" != "$SELF" ]; then
+    if [ -f "$0" ] && grep -q '^# laptop-server:' "$0"; then install -m 755 "$0" "$SELF"
+    else die "run the downloaded script file (or install.sh), not a pipe into bash"; fi
+  fi
+  start_run
+  setup_power
+  [ "$DO_SCREEN" = 1 ]  && setup_screen
+  [ "$DO_BATTERY" = 1 ] && setup_battery
+  [ "$DO_NETWORK" = 1 ] && setup_network
+  [ "$DO_WIFI" = 1 ]    && setup_wifi
+  write_conf_and_unit
+
+  section "Done"
+  if [ "$DRY_RUN" = 1 ]; then say "Dry run finished. Run without --dry-run to apply."
+  else say "Backups: $RUN_DIR   Undo: laptop-server revert   Check: laptop-server status"; fi
+}
+
+# -------------------------------------------------------------- revert ------
+cmd_revert() {
+  [ "$(id -u)" = 0 ] || die "run as root"
+  local dir; dir=$(readlink -f "$BACKUP_ROOT/latest" 2>/dev/null)
+  [ -d "$dir" ] || die "no setup run to revert in $BACKUP_ROOT"
+  say "Reverting setup run $(basename "$dir")"
+  confirm "Restore the files and settings from that run?" || die "cancelled"
+  local f a
+  while read -r f; do [ -n "$f" ] && cp -a "$dir/files$f" "$f" && ok "restored $f"; done < "$dir/backed-up"
+  while read -r f; do [ -n "$f" ] && rm -f "$f" && ok "removed $f"; done < "$dir/created"
+  while read -r a; do
+    case $a in
+      masked*)           # shellcheck disable=SC2086  # word-splitting the target list is intended
+                         systemctl unmask ${a#masked} >/dev/null 2>&1 && ok "unmasked${a#masked}" ;;
+      wifi-off)          apply_wifi on && ok "Wi-Fi radio on" ;;
+      network-proxmox)   ifreload -a && ok "network reloaded" ;;
+      network-netplan)   netplan apply && ok "netplan re-applied" ;;
+      network-networkd)  systemctl disable --now systemd-networkd >/dev/null 2>&1; ifup -a && ok "back on ifupdown" ;;
+    esac
+  done < "$dir/actions"
+  systemctl disable laptop-server.service >/dev/null 2>&1
+  systemctl daemon-reload; udevadm control --reload >/dev/null 2>&1
+  systemctl restart systemd-logind >/dev/null 2>&1
+  rm -f "$BACKUP_ROOT/latest"
+  say "Reverted. Battery thresholds stay until the next reboot or until you change them."
+}
+
+# -------------------------------------------------------------- status ------
+cmd_status() {
+  local t b w r s
+  say "${B}laptop-server status${N}  ($(os_name)$(is_proxmox && echo ", Proxmox VE"))"
+  section "Lid and sleep"
+  say "  lid switch:  $(systemd-analyze cat-config systemd/logind.conf 2>/dev/null | awk -F= '/^HandleLidSwitch=/{v=$2} END{print (v==""?"suspend (default)":v)}')"
+  for t in $SLEEP_TARGETS; do s=$(systemctl is-enabled "$t" 2>/dev/null); printf '  %-32s %s\n' "$t" "${s:-unknown}"; done
+  section "Battery"
+  local bats; bats=$(battery_dirs)
+  if [ -z "$bats" ]; then say "  no battery"; fi
+  for b in $bats; do
+    printf '  %s: %s%% %s  limit start=%s stop=%s%s\n' "${b##*/}" "$(cat "$b/capacity" 2>/dev/null)" "$(cat "$b/status" 2>/dev/null)" \
+      "$(cat "$b/charge_control_start_threshold" 2>/dev/null || echo -)" "$(cat "$b/charge_control_end_threshold" 2>/dev/null || echo 'n/a (set in BIOS)')" \
+      "$( [ -r "$b/charge_types" ] && echo "  mode=$(cat "$b/charge_types")")"
+  done
+  section "Network ($(network_stack))"
+  w=$(wired_ifaces)
+  if is_container; then say "  container: networking is managed by the host"
+  elif [ -z "$w" ]; then say "  ${R}no wired adapter visible${N}: replug it, try another port, or check BIOS USB settings"; fi
+  for i in $w; do
+    printf '  %-18s carrier=%s speed=%s driver=%s%s\n' "$i" "$(cat "/sys/class/net/$i/carrier" 2>/dev/null || echo 0)" \
+      "$(cat "/sys/class/net/$i/speed" 2>/dev/null || echo ?)" "$(basename "$(readlink -f "/sys/class/net/$i/device/driver")" 2>/dev/null)" \
+      "$( [ -e "/sys/class/net/$i/master" ] && echo "  bridge=$(basename "$(readlink -f "/sys/class/net/$i/master")")")"
+  done
+  say "  default route: $(ip -4 route show default 2>/dev/null | head -1)"
+  [ -f "$INTERFACES" ] && grep -q "bridge-ports" "$INTERFACES" && say "  bridge-ports: $(grep -m1 bridge-ports "$INTERFACES" | xargs)"
+  [ -f "$UDEV_RULE" ] && say "  hotplug: $UDEV_RULE -> laptop-server-hotplug.service"
+  [ -f "$NETWORKD_FILE" ] && say "  networkd file: $NETWORKD_FILE"
+  section "Wi-Fi"
+  for r in /sys/class/rfkill/rfkill*; do
+    [ "$(cat "$r/type" 2>/dev/null)" = wlan ] || continue
+    say "  $(cat "$r/name"): $( [ "$(cat "$r/soft")" = 1 ] && echo off || echo on)"
+  done
+  ls /sys/class/rfkill/*/type >/dev/null 2>&1 && grep -qx wlan /sys/class/rfkill/*/type 2>/dev/null || say "  no Wi-Fi radio"
+  section "Boot service"
+  say "  laptop-server.service: $(systemctl is-enabled laptop-server.service 2>/dev/null || echo not installed)"
+  [ -r "$CONF" ] && sed 's/^/  /' "$CONF" | grep -v '^  #'
+}
+
+cmd_wifi() {
+  [ "$(id -u)" = 0 ] || die "run as root"
+  case ${1:-} in
+    on)  apply_wifi on;  sed -i 's/^WIFI_OFF=.*/WIFI_OFF=0/' "$CONF" 2>/dev/null; ok "Wi-Fi radio on (stays on after reboot)" ;;
+    off) apply_wifi off; sed -i 's/^WIFI_OFF=.*/WIFI_OFF=1/' "$CONF" 2>/dev/null; ok "Wi-Fi radio off" ;;
+    *)   die "usage: laptop-server wifi on|off" ;;
+  esac
+}
+
+usage() { sed -n '2,25p' "$0" | sed 's/^# \{0,1\}//'; }
+
+case ${1:-help} in
+  setup)  shift; cmd_setup "$@" ;;
+  status) cmd_status ;;
+  revert) shift; [ "${1:-}" = --yes ] && ASSUME_YES=1; cmd_revert ;;
+  wifi)   shift; cmd_wifi "$@" ;;
+  boot)   cmd_boot ;;
+  version|--version) echo "$VERSION" ;;
+  help|-h|--help) usage ;;
+  *) usage; exit 1 ;;
+esac
